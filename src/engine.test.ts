@@ -717,6 +717,54 @@ describe('WorkflowEngine', () => {
         });
     });
 
+    it('should have status running during retries, not failed', async () => {
+      const statusesDuringRetry: string[] = [];
+      let attemptCount = 0;
+
+      const retryStatusWorkflow = workflow('retry-status-workflow', async ({ step }) => {
+        await step.run('step-1', async () => {
+          attemptCount++;
+          if (attemptCount < 3) {
+            throw new Error('transient failure');
+          }
+          return 'success';
+        });
+        return 'completed';
+      });
+
+      await engine.registerWorkflow(retryStatusWorkflow);
+
+      // Spy on the handler to capture run status at the start of each retry
+      const originalGetRun = engine.getRun.bind(engine);
+      const getRunSpy = vi.spyOn(engine, 'getRun');
+      getRunSpy.mockImplementation(async (...args) => {
+        const result = await originalGetRun(...args);
+        // Capture status when a retry attempt starts (attempt 2+)
+        if (attemptCount > 0 && attemptCount < 3) {
+          statusesDuringRetry.push(result.status);
+        }
+        return result;
+      });
+
+      const run = await engine.startWorkflow({
+        resourceId,
+        workflowId: 'retry-status-workflow',
+        input: {},
+        options: { retries: 3 },
+      });
+
+      await expect
+        .poll(async () => (await originalGetRun({ runId: run.id, resourceId })).status, {
+          timeout: 10000,
+        })
+        .toBe(WorkflowStatus.COMPLETED);
+
+      // The run should never have been in "failed" status during retries
+      expect(statusesDuringRetry).not.toContain(WorkflowStatus.FAILED);
+
+      getRunSpy.mockRestore();
+    });
+
     it('should use exponential backoff for retries', async () => {
       const failingWorkflow = workflow('backoff-workflow', async ({ step }) => {
         await step.run('step-1', async () => {

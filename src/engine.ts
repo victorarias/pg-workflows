@@ -634,6 +634,8 @@ export class WorkflowEngine {
           runId,
           resourceId,
           data: {
+            status: WorkflowStatus.RUNNING,
+            error: null,
             retryCount: run.retryCount + 1,
             jobId: job?.id,
           },
@@ -758,18 +760,6 @@ export class WorkflowEngine {
           runId: run.id,
           workflowId: run.workflowId,
         });
-
-        await this.updateRun(
-          {
-            runId: run.id,
-            resourceId: run.resourceId ?? undefined,
-            data: {
-              status: WorkflowStatus.FAILED,
-              error: error instanceof Error ? `${error.message}\n${error.stack}` : String(error),
-            },
-          },
-          { db },
-        );
 
         throw error;
       }

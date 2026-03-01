@@ -37,10 +37,26 @@ const StepTypeToIcon = {
   [StepType.WAIT_UNTIL]: '⏲',
 };
 
+const VALID_TRANSITIONS: Record<WorkflowStatus, WorkflowStatus[]> = {
+  [WorkflowStatus.PENDING]: [WorkflowStatus.RUNNING],
+  [WorkflowStatus.RUNNING]: [
+    WorkflowStatus.COMPLETED,
+    WorkflowStatus.FAILED,
+    WorkflowStatus.PAUSED,
+    WorkflowStatus.CANCELLED,
+  ],
+  [WorkflowStatus.PAUSED]: [WorkflowStatus.RUNNING, WorkflowStatus.CANCELLED],
+  [WorkflowStatus.COMPLETED]: [],
+  [WorkflowStatus.FAILED]: [],
+  [WorkflowStatus.CANCELLED]: [],
+};
+
 // Timeline entry types
 type TimelineStepEntry = {
   output?: unknown;
-  timestamp: Date;
+  startedAt?: Date;
+  completedAt?: Date;
+  error?: string;
 };
 
 type TimelineWaitForEntry = {
@@ -48,7 +64,7 @@ type TimelineWaitForEntry = {
     eventName: string;
     timeout?: number;
   };
-  timestamp: Date;
+  completedAt: Date;
 };
 
 type WorkflowRunJobParameters = {
@@ -403,6 +419,11 @@ export class WorkflowEngine {
     },
     { db }: { db?: Db } = {},
   ): Promise<WorkflowRun> {
+    if (data.status !== undefined) {
+      const current = await this.getRun({ runId, resourceId }, { db });
+      this.validateTransition(runId, current.status as WorkflowStatus, data.status as WorkflowStatus);
+    }
+
     const run = await updateWorkflowRun({ runId, resourceId, data }, db ?? this.db);
 
     if (!run) {
@@ -410,6 +431,18 @@ export class WorkflowEngine {
     }
 
     return run;
+  }
+
+  private validateTransition(runId: string, from: WorkflowStatus, to: WorkflowStatus): void {
+    if (from === to) return;
+    const allowed = VALID_TRANSITIONS[from];
+    if (!allowed || !allowed.includes(to)) {
+      throw new WorkflowEngineError(
+        `Invalid status transition from "${from}" to "${to}"`,
+        undefined,
+        runId,
+      );
+    }
   }
 
   async checkProgress({
@@ -529,7 +562,7 @@ export class WorkflowEngine {
               timeline: merge(run.timeline, {
                 [run.currentStepId]: {
                   output: event?.data ?? {},
-                  timestamp: new Date(),
+                  completedAt: new Date(),
                 },
               }),
               jobId: job?.id,
@@ -629,6 +662,16 @@ export class WorkflowEngine {
         });
       }
     } catch (error) {
+      // Re-read to get latest state (currentStepId updated outside transaction)
+      try {
+        run = await this.getRun({ runId, resourceId });
+      } catch {}
+
+      const stepError = error instanceof Error ? error.message : String(error);
+      const timelineWithError = run.currentStepId
+        ? merge(run.timeline, { [run.currentStepId]: { error: stepError } })
+        : run.timeline;
+
       if (run.retryCount < run.maxRetries) {
         await this.updateRun({
           runId,
@@ -637,6 +680,7 @@ export class WorkflowEngine {
             status: WorkflowStatus.RUNNING,
             error: null,
             retryCount: run.retryCount + 1,
+            timeline: timelineWithError,
             jobId: job?.id,
           },
         });
@@ -664,7 +708,8 @@ export class WorkflowEngine {
         resourceId,
         data: {
           status: WorkflowStatus.FAILED,
-          error: error instanceof Error ? error.message : String(error),
+          error: stepError,
+          timeline: timelineWithError,
           jobId: job?.id,
         },
       });
@@ -682,6 +727,40 @@ export class WorkflowEngine {
     run: WorkflowRun;
     handler: () => Promise<unknown>;
   }) {
+    // Read latest run state so we don't overwrite timeline entries from prior steps
+    const latestRun = await this.getRun({ runId: run.id, resourceId: run.resourceId ?? undefined });
+
+    // Skip if workflow is no longer running (e.g., paused by a previous waitFor step)
+    if (
+      latestRun.status === WorkflowStatus.CANCELLED ||
+      latestRun.status === WorkflowStatus.PAUSED ||
+      latestRun.status === WorkflowStatus.FAILED
+    ) {
+      return;
+    }
+
+    // Only write startedAt + currentStepId if the step hasn't been completed yet (skip during replay)
+    const existingEntry = latestRun.timeline[stepId];
+    const alreadyCompleted =
+      existingEntry &&
+      typeof existingEntry === 'object' &&
+      'output' in existingEntry &&
+      (existingEntry as TimelineStepEntry).output !== undefined;
+
+    if (!alreadyCompleted) {
+      // Write startedAt + currentStepId OUTSIDE the transaction so they survive rollback on failure
+      run = await this.updateRun({
+        runId: run.id,
+        resourceId: run.resourceId ?? undefined,
+        data: {
+          currentStepId: stepId,
+          timeline: merge(latestRun.timeline, {
+            [stepId]: { startedAt: new Date() },
+          }),
+        },
+      });
+    }
+
     return withPostgresTransaction(this.db, async (db) => {
       const persistedRun = await this.getRun(
         { runId: run.id, resourceId: run.resourceId ?? undefined },
@@ -718,17 +797,6 @@ export class WorkflowEngine {
         if (timelineStep?.output !== undefined) {
           result = timelineStep.output;
         } else {
-          await this.updateRun(
-            {
-              runId: run.id,
-              resourceId: run.resourceId ?? undefined,
-              data: {
-                currentStepId: stepId,
-              },
-            },
-            { db },
-          );
-
           this.logger.log(`Running step ${stepId}...`, {
             runId: run.id,
             workflowId: run.workflowId,
@@ -741,10 +809,10 @@ export class WorkflowEngine {
               runId: run.id,
               resourceId: run.resourceId ?? undefined,
               data: {
-                timeline: merge(run.timeline, {
+                timeline: merge(persistedRun.timeline, {
                   [stepId]: {
                     output: result === undefined ? {} : result,
-                    timestamp: new Date(),
+                    completedAt: new Date(),
                   },
                 }),
               },
@@ -812,13 +880,13 @@ export class WorkflowEngine {
       data: {
         status: WorkflowStatus.PAUSED,
         currentStepId: stepId,
-        timeline: merge(run.timeline, {
+        timeline: merge(persistedRun.timeline, {
           [`${stepId}-wait-for`]: {
             waitFor: {
               eventName,
               timeout,
             },
-            timestamp: new Date(),
+            completedAt: new Date(),
           },
         }),
         pausedAt: new Date(),

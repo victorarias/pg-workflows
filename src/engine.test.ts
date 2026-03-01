@@ -33,6 +33,22 @@ const testWorkflow = workflow(
   },
 );
 
+let failTimelineAttempt = 0;
+const failTimelineWorkflow = workflow('fail-timeline', async ({ step }) => {
+  await step.run('boom', async () => {
+    throw new Error('step exploded');
+  });
+});
+
+const retryTimelineWorkflow = workflow('retry-timeline', async ({ step }) => {
+  await step.run('flaky', async () => {
+    failTimelineAttempt++;
+    if (failTimelineAttempt < 2) throw new Error('transient');
+    return 'ok';
+  });
+  return 'done';
+});
+
 describe('WorkflowEngine', () => {
   const resourceId = 'testResourceId';
 
@@ -952,6 +968,158 @@ describe('WorkflowEngine', () => {
             results: ['started', 'loop-0', 'loop-1', 'ended'],
           },
         });
+    });
+  });
+
+  describe('state transition validation', () => {
+    let engine: WorkflowEngine;
+
+    beforeEach(async () => {
+      engine = new WorkflowEngine({
+        workflows: [testWorkflow],
+        boss: testBoss,
+      });
+      await engine.start();
+    });
+
+    afterEach(async () => {
+      await engine.stop();
+    });
+
+    it('should reject cancelling a completed workflow', async () => {
+      const run = await engine.startWorkflow({
+        resourceId,
+        workflowId: 'test-workflow',
+        input: { data: 'test' },
+      });
+
+      await expect
+        .poll(async () => (await engine.getRun({ runId: run.id, resourceId })).status)
+        .toBe(WorkflowStatus.COMPLETED);
+
+      await expect(
+        engine.cancelWorkflow({ runId: run.id, resourceId }),
+      ).rejects.toThrow('Invalid status transition from "completed" to "cancelled"');
+    });
+
+    it('should reject cancelling a failed workflow', async () => {
+      const failWorkflow = workflow('fail-for-cancel', async ({ step }) => {
+        await step.run('boom', async () => {
+          throw new Error('fail');
+        });
+      });
+
+      await engine.registerWorkflow(failWorkflow);
+      const run = await engine.startWorkflow({
+        resourceId,
+        workflowId: 'fail-for-cancel',
+        input: {},
+      });
+
+      await expect
+        .poll(async () => (await engine.getRun({ runId: run.id, resourceId })).status)
+        .toBe(WorkflowStatus.FAILED);
+
+      await expect(
+        engine.cancelWorkflow({ runId: run.id, resourceId }),
+      ).rejects.toThrow('Invalid status transition from "failed" to "cancelled"');
+    });
+
+    it('should allow cancelling a paused workflow', async () => {
+      const pauseWorkflow = workflow('pause-then-cancel', async ({ step }) => {
+        await step.run('step-1', async () => 'ok');
+        await step.pause('wait');
+        return 'done';
+      });
+
+      await engine.registerWorkflow(pauseWorkflow);
+      const run = await engine.startWorkflow({
+        resourceId,
+        workflowId: 'pause-then-cancel',
+        input: {},
+      });
+
+      await expect
+        .poll(async () => (await engine.getRun({ runId: run.id, resourceId })).status)
+        .toBe(WorkflowStatus.PAUSED);
+
+      const cancelled = await engine.cancelWorkflow({ runId: run.id, resourceId });
+      expect(cancelled.status).toBe(WorkflowStatus.CANCELLED);
+    });
+  });
+
+  describe('enriched timeline', () => {
+    let engine: WorkflowEngine;
+
+    beforeEach(async () => {
+      engine = new WorkflowEngine({
+        workflows: [testWorkflow],
+        boss: testBoss,
+      });
+      await engine.start();
+    });
+
+    afterEach(async () => {
+      await engine.stop();
+    });
+
+    it('should record startedAt and completedAt for completed steps', async () => {
+      const run = await engine.startWorkflow({
+        resourceId,
+        workflowId: 'test-workflow',
+        input: { data: 'test' },
+      });
+
+      await expect
+        .poll(async () => (await engine.getRun({ runId: run.id, resourceId })).status)
+        .toBe(WorkflowStatus.COMPLETED);
+
+      const completed = await engine.getRun({ runId: run.id, resourceId });
+      const step1 = completed.timeline['step-1'] as { startedAt?: string; completedAt?: string; output?: unknown };
+      expect(step1.startedAt).toBeDefined();
+      expect(step1.completedAt).toBeDefined();
+      expect(step1.output).toEqual({ result: 'test' });
+    });
+
+    it('should record startedAt and error for failed steps', async () => {
+      await engine.registerWorkflow(failTimelineWorkflow);
+      const run = await engine.startWorkflow({
+        resourceId,
+        workflowId: 'fail-timeline',
+        input: {},
+      });
+
+      await expect
+        .poll(async () => (await engine.getRun({ runId: run.id, resourceId })).status)
+        .toBe(WorkflowStatus.FAILED);
+
+      const failed = await engine.getRun({ runId: run.id, resourceId });
+      const step = failed.timeline.boom as { startedAt?: string; error?: string; completedAt?: string };
+      expect(step.startedAt).toBeDefined();
+      expect(step.error).toBe('step exploded');
+      expect(step.completedAt).toBeUndefined();
+    });
+
+    it('should have startedAt, error, and completedAt for retried-then-succeeded steps', async () => {
+      failTimelineAttempt = 0;
+      await engine.registerWorkflow(retryTimelineWorkflow);
+      const run = await engine.startWorkflow({
+        resourceId,
+        workflowId: 'retry-timeline',
+        input: {},
+        options: { retries: 3 },
+      });
+
+      await expect
+        .poll(async () => (await engine.getRun({ runId: run.id, resourceId })).status, { timeout: 10000 })
+        .toBe(WorkflowStatus.COMPLETED);
+
+      const completed = await engine.getRun({ runId: run.id, resourceId });
+      const step = completed.timeline.flaky as { startedAt?: string; error?: string; completedAt?: string; output?: unknown };
+      expect(step.startedAt).toBeDefined();
+      expect(step.error).toBe('transient');
+      expect(step.completedAt).toBeDefined();
+      expect(step.output).toBe('ok');
     });
   });
 
